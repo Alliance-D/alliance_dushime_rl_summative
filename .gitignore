@@ -1,0 +1,34 @@
+# Python virtual environments
+env/
+venv/
+ENV/
+myenv/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+*.sublime-workspace
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Package files
+*.egg-info/
+dist/
+build/
+
+# OS specific
+.env.local
