@@ -405,7 +405,7 @@ class KigaliRenderer:
         bname=BNAME_BY_PHASE[phase_cap]
         bcol=BIZ_COLS.get(PHASE_TO_CELL[phase_cap],(200,200,200))
         t2=self.fn_sm.render(f"Scouting: {bname}  (phase {phase_cap+1}/4)  "
-                              f"step {step}/{300}",True,bcol)
+                              f"step {step}/{400}",True,bcol)
         self.screen.blit(t2,(12,28))
         if status:
             t3=self.fn_xs.render(status,True,(148,168,208))

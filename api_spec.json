@@ -1,0 +1,61 @@
+{
+  "api_version": "3.0",
+  "project": "Kigali Retail Navigator - RL Policy API",
+  "algorithm": "REINFORCE",
+  "best_run": 12,
+  "training_mean_reward": 76.49,
+  "training_config": "lr=0.001  gamma=0.99  entropy_coef=0.02  hidden=256  diff=0.2",
+  "description": "POST /predict with a 56-dim normalised observation vector. Returns action 0-5. Call repeatedly per step. Action 5 (PLACE) means current cell is the recommended site for the current business phase.",
+  "endpoint": "POST /predict",
+  "input": {
+    "observation": {
+      "type": "array",
+      "length": 56,
+      "dtype": "float32",
+      "description": "5x5 local grid view (25) + position (2) + viability (1) + context (28). Built from GPS + OSM landmark scan."
+    }
+  },
+  "output": {
+    "action": {
+      "type": "int",
+      "range": "0-5"
+    },
+    "action_name": {
+      "type": "string"
+    },
+    "is_placement": {
+      "type": "bool"
+    },
+    "current_phase": {
+      "type": "int",
+      "range": "0-3"
+    },
+    "business_type": {
+      "type": "string"
+    }
+  },
+  "phases": {
+    "0": "Grocery",
+    "1": "Pharmacy",
+    "2": "Restaurant",
+    "3": "Salon"
+  },
+  "actions": {
+    "0": "Move UP",
+    "1": "Move DOWN",
+    "2": "Move LEFT",
+    "3": "Move RIGHT",
+    "4": "Survey",
+    "5": "PLACE"
+  },
+  "production": [
+    "1. Wrap model.predict() in FastAPI POST /predict",
+    "2. Encode entrepreneur GPS + 50m OSM landmark scan -> 56-dim obs",
+    "3. React Native app calls API at each walking step",
+    "4. When action=5: display recommended business + location on map",
+    "5. Phase auto-advances: Grocery -> Pharmacy -> Restaurant -> Salon",
+    "6. Retrain quarterly as competitor landscape evolves"
+  ],
+  "latency": "~0.3ms CPU inference - suitable for real-time mobile",
+  "model_file": "models/pg/reinforce_run_12.zip"
+}

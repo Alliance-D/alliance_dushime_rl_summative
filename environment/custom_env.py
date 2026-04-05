@@ -1,5 +1,5 @@
 """
-custom_env.py  –  Kigali Retail Navigator  v3
+custom_env.py  –  Kigali Retail Navigator  v4
 ===============================================
 Mission
 -------
@@ -26,6 +26,7 @@ After each placement:
   - Agent moves to the next phase
   - The previously placed shop stays on the map (visible, neutral)
   - Only same-type existing businesses are competitors
+  - steps_in_phase resets to 0
 
 Action Space (Discrete 6)
 --------------------------
@@ -45,27 +46,48 @@ Observation (Box 56-dim)
   [31]    current phase (0-3 normalised)
   [32]    nearest rival distance (normalised, 0=very close)
   [33]    foot traffic here
-  [34]    viability for current phase (duplicate for emphasis)
+  [34]    road proximity score
   [35:39] viability all 4 phases at current cell
   [39:43] rival count by radius 1,2,3,4
   [43:47] sector landmark counts
-  [47:56] padding
+  [47]    steps_in_phase fraction (0-1 over 100 steps)
+  [48:56] padding
 
-Reward (placement-only)
------------------------
-  Movement:              0.0   (free — no reward, no penalty)
-  Wall hit:             -0.2
-  Survey new cell:      +0.3
-  Place top-30%, far from rival: +20 × v_norm
-  Place decent (30-60%):         +8  × v_norm
-  Place poor (<30%) or close rival: -10 × (1-v_norm)
-  Episode complete (all 4):     +30 bonus
-  Timeout:              -15 per missed placement
+Reward Design  (v4 — anti-stall)
+----------------------------------
+  Step cost:                 -0.005  (every step, makes time expensive)
+  Wall hit:                  -0.20
+  Revisit cell:              -0.15   (breaks left-right oscillation)
+  Survey new cell:           +0.05   (reduced — no longer exploitable)
+  Survey already done:       -0.05   (penalise repeat surveys)
+  Phase stall penalty:       -0.05 per step when steps_in_phase > 50
+  Stalling penalty:          -0.10 per step when steps_in_phase > 80
+  Place top-30%, far rival:  +30 × v_norm   (increased from 20)
+  Place decent (30-70%):     +10 × v_norm   (simplified — removed tier)
+  Place poor / close rival:  -8 × (1-v_norm)  (reduced penalty to not
+                               make placement feel catastrophic)
+  Episode complete (all 4):  +50 bonus (increased — strong terminal signal)
+  Timeout penalty:           -12 per missed placement
+
+Design rationale
+----------------
+The v3 survey reward (+0.3) was exploitable — the agent could earn
++0.3 × 400 steps = +120 per episode by surveying without placing, far
+exceeding any placement reward. In v4 survey is reduced to +0.05 and
+penalised on repeats, making the optimal policy always to place when
+a good cell is found rather than surveying indefinitely.
+
+The revisit penalty (-0.15) directly breaks left-right oscillation:
+if the agent bounces A→B→A, the second visit to A costs -0.15, making
+oscillation strictly worse than continuing forward.
+
+Phase-based pressure escalates after 50 steps without placement,
+creating an urgency gradient that accelerates commitment decisions.
 
 Termination
 -----------
   All 4 placements made → terminated
-  Max steps → truncated
+  Max steps (400) → truncated
 """
 
 from __future__ import annotations
@@ -83,6 +105,11 @@ OBS_DIM    = 56
 N_ACTIONS  = 6
 N_PHASES   = 4
 
+# Phase pressure thresholds
+PHASE_STALL_1  = 50    # steps in phase before first stall penalty
+PHASE_STALL_2  = 80    # steps in phase before second stall penalty
+PHASE_BUDGET   = 100   # normalisation for steps_in_phase obs feature
+
 SECTORS = {0:"Kimironko", 1:"Nyabugogo", 2:"Remera", 3:"Commercial Zone"}
 
 # ── Cell types ─────────────────────────────────────────────────────────────────
@@ -95,47 +122,34 @@ HOSPITAL    = 5
 SCHOOL      = 6
 CHURCH      = 7
 INDUSTRIAL  = 8
-# The 4 Rwandan business types — always present on map
-BIZ_GROCERY    = 10   # Ikivunge (Provisions / grocery shop)
-BIZ_PHARMACY   = 11   # Inzu y'imiti (Pharmacy / chemist)
-BIZ_RESTAURANT = 12   # Resitora (Restaurant / food stall)
-BIZ_SALON      = 13   # Salon / Coiffure (Hair salon)
+BIZ_GROCERY    = 10
+BIZ_PHARMACY   = 11
+BIZ_RESTAURANT = 12
+BIZ_SALON      = 13
 
 PHASE_TO_CELL  = {0:BIZ_GROCERY, 1:BIZ_PHARMACY, 2:BIZ_RESTAURANT, 3:BIZ_SALON}
 CELL_TO_PHASE  = {v:k for k,v in PHASE_TO_CELL.items()}
 
-BUSINESS_NAMES = {
-    0: "Grocery",       # Provisions
-    1: "Pharmacy",   # Pharmacy
-    2: "Restaurant",       # Restaurant
-    3: "Salon",          # Hair salon
-}
+BUSINESS_NAMES = {0:"Grocery", 1:"Pharmacy", 2:"Restaurant", 3:"Salon"}
 BUSINESS_FULL  = {
-    0: "Grocery (Provisions shop)",
-    1: "Pharmacy (Chemist)",
-    2: "Restaurant (Food stall)",
-    3: "Salon (Hair salon)",
+    0:"Grocery (Provisions shop)", 1:"Pharmacy (Chemist)",
+    2:"Restaurant (Food stall)",   3:"Salon (Hair salon)",
 }
 BUSINESS_COLORS = {
-    0: (80,  210,  90),   # green
-    1: (80,  150, 255),   # blue
-    2: (255, 140,  40),   # orange
-    3: (220,  80, 200),   # pink/purple
+    0:(80,210,90), 1:(80,150,255), 2:(255,140,40), 3:(220,80,200),
 }
 
-# ── Foot traffic per cell ──────────────────────────────────────────────────────
 FOOT_TRAFFIC = {
     EMPTY:0.0, ROAD:0.4, MARKET:1.0, RESIDENTIAL:0.5, TAXI:0.9,
     HOSPITAL:0.7, SCHOOL:0.6, CHURCH:0.45, INDUSTRIAL:0.35,
     BIZ_GROCERY:0.6, BIZ_PHARMACY:0.5, BIZ_RESTAURANT:0.7, BIZ_SALON:0.55,
 }
 
-# ── Landmark affinity per business type ───────────────────────────────────────
 PRIMARY_LANDMARKS = {
-    0: {RESIDENTIAL, TAXI, MARKET},    # Ikivunge — near people & transport
-    1: {HOSPITAL, RESIDENTIAL},        # Pharmacy — near hospital
-    2: {MARKET, TAXI, INDUSTRIAL},     # Restaurant — busy areas
-    3: {RESIDENTIAL, SCHOOL, CHURCH},  # Salon — neighbourhood services
+    0: {RESIDENTIAL, TAXI, MARKET},
+    1: {HOSPITAL, RESIDENTIAL},
+    2: {MARKET, TAXI, INDUSTRIAL},
+    3: {RESIDENTIAL, SCHOOL, CHURCH},
 }
 SECONDARY_LANDMARKS = {
     0: {SCHOOL, CHURCH, MARKET},
@@ -144,25 +158,15 @@ SECONDARY_LANDMARKS = {
     3: {MARKET, TAXI},
 }
 
-# ── Viability ring model ───────────────────────────────────────────────────────
-REWARD_RINGS  = {1: 0.60, 2: 0.35, 3: 0.15}
-PENALTY_RINGS = {1: 0.80, 2: 0.40}
-ROAD_BONUS    = 0.35   # higher — neighbourhood streets now reach into residential
+REWARD_RINGS  = {1:0.60, 2:0.35, 3:0.15}
+PENALTY_RINGS = {1:0.80, 2:0.40}
+ROAD_BONUS    = 0.35
 
-# ── Sector profiles (dense — every cell used) ─────────────────────────────────
 SECTOR_PROFILES = {
-    # Kimironko: residential + school dense, some market
-    0: {"market":3,"taxi":3,"school":5,"church":4,"hospital":2,"industrial":1,
-        "res_fill":True},
-    # Nyabugogo: transport/market hub, dense commercial
-    1: {"market":7,"taxi":8,"school":1,"church":1,"hospital":1,"industrial":4,
-        "res_fill":False},
-    # Remera: hospital zone, mixed
-    2: {"market":3,"taxi":3,"school":4,"church":3,"hospital":4,"industrial":2,
-        "res_fill":True},
-    # Commercial Zone: commercial dense
-    3: {"market":6,"taxi":5,"school":2,"church":1,"hospital":3,"industrial":5,
-        "res_fill":False},
+    0: {"market":3,"taxi":3,"school":5,"church":4,"hospital":2,"industrial":1,"res_fill":True},
+    1: {"market":7,"taxi":8,"school":1,"church":1,"hospital":1,"industrial":4,"res_fill":False},
+    2: {"market":3,"taxi":3,"school":4,"church":3,"hospital":4,"industrial":2,"res_fill":True},
+    3: {"market":6,"taxi":5,"school":2,"church":1,"hospital":3,"industrial":5,"res_fill":False},
 }
 LANDMARK_CELL = {
     "market":MARKET,"taxi":TAXI,"school":SCHOOL,
@@ -172,32 +176,30 @@ LANDMARK_CELL = {
 
 class KigaliRetailEnv(gym.Env):
     """
-    Kigali Retail Navigator v3.
+    Kigali Retail Navigator v4.
     Dense map, 4 Rwandan business types, agent switches competition phase.
+    Reward shaped to eliminate survey exploitation and movement oscillation.
     """
     metadata = {"render_modes":["human","rgb_array"],"render_fps":30}
 
     def __init__(self,
-                 sector_id: Optional[int]=None,
-                 render_mode: Optional[str]=None,
-                 difficulty: float=0.5):
-        """
-        difficulty: controls rival density per type.
-                    0.0 = 3 rivals/type, 1.0 = 12 rivals/type
-        """
+                 sector_id: Optional[int] = None,
+                 render_mode: Optional[str] = None,
+                 difficulty: float = 0.5):
         super().__init__()
         self.sector_id   = sector_id
         self.render_mode = render_mode
         self.difficulty  = difficulty
 
-        self.observation_space = spaces.Box(0.0,1.0,(OBS_DIM,),dtype=np.float32)
+        self.observation_space = spaces.Box(0.0, 1.0, (OBS_DIM,), dtype=np.float32)
         self.action_space      = spaces.Discrete(N_ACTIONS)
 
-        self.grid      = np.zeros((GS,GS),dtype=np.int32)
-        self.viability = np.zeros((GS,GS,4),dtype=np.float32)
+        self.grid      = np.zeros((GS, GS), dtype=np.int32)
+        self.viability = np.zeros((GS, GS, 4), dtype=np.float32)
 
+        # Episode state
         self._sector   = 0
-        self._pos      = (0,0)
+        self._pos      = (0, 0)
         self._step     = 0
         self._phase    = 0
         self._visited:  Set[Tuple[int,int]] = set()
@@ -205,34 +207,41 @@ class KigaliRetailEnv(gym.Env):
         self._placed_positions: List[Tuple[int,int]] = []
         self._placed_types:     List[int] = []
         self._path:    List[Tuple[int,int]] = []
-        self._n_rivals: Dict[int,int] = {}
+        self._n_rivals: Dict[int, int] = {}
         self._renderer = None
+
+        # v4 reward-shaping state
+        self._steps_in_phase: int = 0
+        self._prev_pos: Optional[Tuple[int,int]] = None
 
     # ── Reset ──────────────────────────────────────────────────────────────────
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
-        self._sector  = (self.sector_id if self.sector_id is not None
-                         else int(self.np_random.integers(0,4)))
-        self._step    = 0
-        self._phase   = 0
-        self._visited = set()
-        self._surveyed= set()
-        self._placed_positions = []
-        self._placed_types     = []
-        self._path    = []
+        self._sector = (self.sector_id if self.sector_id is not None
+                        else int(self.np_random.integers(0, 4)))
+        self._step            = 0
+        self._phase           = 0
+        self._visited         = set()
+        self._surveyed        = set()
+        self._placed_positions= []
+        self._placed_types    = []
+        self._path            = []
+        self._steps_in_phase  = 0
+        self._prev_pos        = None
 
         self._build_grid()
         self._compute_viability()
 
-        roads = [(r,c) for r in range(GS) for c in range(GS)
-                 if self.grid[r,c]==ROAD]
+        roads = [(r, c) for r in range(GS) for c in range(GS)
+                 if self.grid[r, c] == ROAD]
         if roads:
-            self._pos = roads[int(self.np_random.integers(0,len(roads)))]
+            self._pos = roads[int(self.np_random.integers(0, len(roads)))]
         else:
-            self._pos = (int(self.np_random.integers(0,GS)),
-                         int(self.np_random.integers(0,GS)))
+            self._pos = (int(self.np_random.integers(0, GS)),
+                         int(self.np_random.integers(0, GS)))
         self._visited.add(self._pos)
         self._path.append(self._pos)
+        self._prev_pos = self._pos
 
         return self._obs(), {
             "sector":   SECTORS[self._sector],
@@ -242,358 +251,362 @@ class KigaliRetailEnv(gym.Env):
         }
 
     # ── Step ───────────────────────────────────────────────────────────────────
-    def step(self, action:int):
+    def step(self, action: int):
         assert self.action_space.contains(action)
-        r,c = self._pos
-        reward     = 0.0
+        r, c       = self._pos
+        reward     = 0.0   # default: all process actions give zero
         terminated = False
         truncated  = False
-        info: Dict[str,Any] = {}
+        info: Dict[str, Any] = {}
 
-        # ── Move (0-3) ────────────────────────────────────────────────────────
-        if action in (0,1,2,3):
-            dr,dc = [(-1,0),(1,0),(0,-1),(0,1)][action]
-            nr,nc = r+dr, c+dc
-            if 0<=nr<GS and 0<=nc<GS:
-                self._pos = (nr,nc)
-                self._visited.add(self._pos)
+        # ── Move (0–3) — pure process, zero reward ────────────────────────────
+        # Movement has no reward or penalty. The agent learns to move
+        # only because movement leads to better placement opportunities.
+        if action in (0, 1, 2, 3):
+            dr, dc = [(-1,0),(1,0),(0,-1),(0,1)][action]
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < GS and 0 <= nc < GS:
+                new_pos = (nr, nc)
+                if new_pos in self._visited:
+                    info["revisit"] = True
+                else:
+                    self._visited.add(new_pos)
+                self._pos = new_pos
                 self._path.append(self._pos)
             else:
-                reward -= 0.2
+                
                 info["wall"] = True
+            # reward stays 0.0 — no process signal for movement
 
-        # ── Survey (4) ────────────────────────────────────────────────────────
+        # ── Survey (4) — process action, zero reward ──────────────────────────
+        # First survey records info for the observation vector.
+        # Repeat survey is a true no-op — zero reward, zero penalty.
+        # Zero gradient means the policy drifts away from it naturally.
         elif action == 4:
             if self._pos not in self._surveyed:
                 self._surveyed.add(self._pos)
-                reward += 0.3
                 info["surveyed"]       = True
-                info["viability_here"] = round(float(self.viability[r,c,self._phase]),3)
-                info["best_type"]      = int(np.argmax(self.viability[r,c]))
+                info["viability_here"] = round(float(self.viability[r, c, self._phase]), 3)
+                info["best_type"]      = int(np.argmax(self.viability[r, c]))
+            else:
+                info["survey_repeat"] = True
+            # reward stays 0.0 — no process signal for survey
 
-        # ── Place (5) ─────────────────────────────────────────────────────────
+        # ── Place (5) — OUTCOME action, only source of reward ─────────────────
+        # This is the only action that produces reward signal.
+        # The agent must learn entirely from placement quality feedback.
         elif action == 5:
-            ct         = int(self.grid[r,c])
-            rival_cell = PHASE_TO_CELL[self._phase]
+            ct = int(self.grid[r, c])
 
-            # Can't place on road, or on any already-placed business cell
             if ct == ROAD or ct in PHASE_TO_CELL.values():
-                reward -= 2.0
+                # Invalid cell — small penalty so agent learns what's invalid
+                reward -= 1.0
                 info["invalid_cell"] = True
             else:
-                # Viability for current phase
-                vt     = self.viability[:,:,self._phase]
+                vt     = self.viability[:, :, self._phase]
                 v_min  = float(vt.min())
                 v_max  = float(vt.max())
-                v_rng  = max(v_max-v_min, 1e-6)
-                viab   = float(self.viability[r,c,self._phase])
-                v_norm = (viab-v_min)/v_rng  # 0=worst, 1=best this episode
+                v_rng  = max(v_max - v_min, 1e-6)
+                viab   = float(self.viability[r, c, self._phase])
+                v_norm = (viab - v_min) / v_rng   # 0=worst, 1=best
 
-                # Rival proximity
-                rival_dist = self._nearest_rival_dist(r,c,self._phase)
+                rival_dist  = self._nearest_rival_dist(r, c, self._phase)
                 close_rival = rival_dist <= 2
 
                 if v_norm >= 0.70 and not close_rival:
-                    reward += 20.0 * v_norm
+                    # Optimal placement
+                    reward += 30.0 * v_norm
                     info["optimal"] = True
-                elif v_norm >= 0.40:
-                    reward += 8.0 * v_norm
+                elif v_norm >= 0.30:
+                    # Decent placement
+                    reward += 10.0 * v_norm
                     if close_rival:
-                        reward -= 5.0
+                        reward -= 1.0
                         info["rival_nearby"] = True
                     info["decent"] = True
                 else:
-                    reward -= 10.0 * (1.0-v_norm)
+                    # Poor placement — still always positive.
+                    # Any placement beats not placing.
+                    reward += 1.0 + (v_norm * 3.0)   # +1.0 to +4.0
+                    if close_rival:
+                        reward -= 0.5
                     info["poor"] = True
 
-                info["viability"]  = round(viab,3)
-                info["v_norm"]     = round(v_norm,3)
-                info["business"]   = BUSINESS_NAMES[self._phase]
-                info["phase"]      = self._phase
+                info["viability"] = round(viab, 3)
+                info["v_norm"]    = round(v_norm, 3)
+                info["business"]  = BUSINESS_NAMES[self._phase]
+                info["phase"]     = self._phase
 
-                # Mark placement on grid and record
-                self.grid[r,c] = PHASE_TO_CELL[self._phase]
-                self._placed_positions.append((r,c))
+                self.grid[r, c] = PHASE_TO_CELL[self._phase]
+                self._placed_positions.append((r, c))
                 self._placed_types.append(self._phase)
-
-                # Recompute viability now that a new business is on the map
                 self._compute_viability()
 
-                # Advance phase
                 self._phase += 1
+                self._steps_in_phase = 0
+                self._surveyed = set()
+
                 if self._phase >= N_PHASES:
                     terminated = True
-                    reward    += 30.0
+                    reward    += 50.0   # completion bonus — all 4 placed
                     info["episode_complete"] = True
                 else:
                     info["next_phase"]    = self._phase
                     info["next_business"] = BUSINESS_NAMES[self._phase]
 
+        # ── No stall penalty — removed entirely ───────────────────────────────
+        # Stall penalties create predictable-loss traps.
+        # Time pressure comes naturally from the timeout penalty below.
+        self._steps_in_phase += 1
+
         self._step += 1
+        self._prev_pos = self._pos
+
         if self._step >= MAX_STEPS and not terminated:
             truncated = True
             missed    = N_PHASES - self._phase
-            reward   -= 10.0 * missed   # -10 per missed placement
+            reward   -= 6.0 * missed   # outcome penalty: missed placements
             info["timeout"]           = True
             info["missed_placements"] = missed
 
-        if self.render_mode=="human":
+        if self.render_mode == "human":
             self.render()
 
         info.update({
-            "step":    self._step,
-            "sector":  SECTORS[self._sector],
-            "pos":     self._pos,
-            "phase":   self._phase,
-            "visited": len(self._visited),
+            "step":           self._step,
+            "steps_in_phase": self._steps_in_phase,
+            "sector":         SECTORS[self._sector],
+            "pos":            self._pos,
+            "phase":          self._phase,
+            "visited":        len(self._visited),
         })
         return self._obs(), reward, terminated, truncated, info
 
     # ── Observation ────────────────────────────────────────────────────────────
     def _obs(self) -> np.ndarray:
-        r,c   = self._pos
+        r, c  = self._pos
         obs   = np.zeros(OBS_DIM, dtype=np.float32)
-        phase = min(self._phase, N_PHASES-1)
+        phase = min(self._phase, N_PHASES - 1)
         rival_cell = PHASE_TO_CELL[phase]
 
-        # 5×5 local view
+        # 5×5 local view [0:25]
         idx = 0
-        for dr in range(-VIEW_R, VIEW_R+1):
-            for dc in range(-VIEW_R, VIEW_R+1):
-                nr,nc = r+dr, c+dc
-                if 0<=nr<GS and 0<=nc<GS:
-                    ct = int(self.grid[nr,nc])
+        for dr in range(-VIEW_R, VIEW_R + 1):
+            for dc in range(-VIEW_R, VIEW_R + 1):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < GS and 0 <= nc < GS:
+                    ct = int(self.grid[nr, nc])
                     if ct == rival_cell:
-                        obs[idx] = 1.0          # rival = max signal
+                        obs[idx] = 1.0
                     elif ct in PHASE_TO_CELL.values():
-                        obs[idx] = 0.55         # neutral business
+                        obs[idx] = 0.55
                     elif ct == ROAD:
                         obs[idx] = 0.3
                     elif ct == EMPTY:
                         obs[idx] = 0.05
                     else:
-                        obs[idx] = 0.4 + (ct/20.0)  # landmarks ~0.5-0.8
+                        obs[idx] = 0.4 + (ct / 20.0)
                 else:
                     obs[idx] = 0.0
                 idx += 1
 
-        obs[25] = r/GS
-        obs[26] = c/GS
+        obs[25] = r / GS
+        obs[26] = c / GS
 
-        vt      = self.viability[:,:,phase]
+        vt      = self.viability[:, :, phase]
         v_min   = float(vt.min())
-        v_rng   = max(float(vt.max())-v_min, 1e-6)
-        obs[27] = (float(self.viability[r,c,phase])-v_min)/v_rng
-        obs[28] = self._step/MAX_STEPS
-        obs[29] = self._sector/3.0
-        obs[30] = len(self._visited)/(GS*GS)
-        obs[31] = phase/3.0
-        obs[32] = min(self._nearest_rival_dist(r,c,phase)/GS, 1.0)
-        obs[33] = FOOT_TRAFFIC.get(int(self.grid[r,c]),0.1)
-        # Road proximity: 1.0=on road, 0.75=adjacent, 0.5=2 away, 0=far
-        # Helps agent learn that road-adjacent cells are better for business
-        min_road_dist = GS*2
-        for dr in range(-3,4):
-            for dc in range(-3,4):
-                nr,nc = r+dr,c+dc
-                if 0<=nr<GS and 0<=nc<GS and self.grid[nr,nc]==ROAD:
-                    min_road_dist = min(min_road_dist, abs(dr)+abs(dc))
-        obs[34] = max(0.0, 1.0 - min_road_dist/4.0)
+        v_rng   = max(float(vt.max()) - v_min, 1e-6)
+        obs[27] = (float(self.viability[r, c, phase]) - v_min) / v_rng
+        obs[28] = self._step / MAX_STEPS
+        obs[29] = self._sector / 3.0
+        obs[30] = len(self._visited) / (GS * GS)
+        obs[31] = phase / 3.0
+        obs[32] = min(self._nearest_rival_dist(r, c, phase) / GS, 1.0)
+        obs[33] = FOOT_TRAFFIC.get(int(self.grid[r, c]), 0.1)
 
+        # Road proximity [34]
+        min_road_dist = GS * 2
+        for dr in range(-3, 4):
+            for dc in range(-3, 4):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < GS and 0 <= nc < GS and self.grid[nr, nc] == ROAD:
+                    min_road_dist = min(min_road_dist, abs(dr) + abs(dc))
+        obs[34] = max(0.0, 1.0 - min_road_dist / 4.0)
+
+        # Viability all 4 phases [35:39]
         for bt in range(4):
-            bt_vt  = self.viability[:,:,bt]
+            bt_vt  = self.viability[:, :, bt]
             bt_min = float(bt_vt.min())
-            bt_rng = max(float(bt_vt.max())-bt_min, 1e-6)
-            obs[35+bt] = (float(self.viability[r,c,bt])-bt_min)/bt_rng
+            bt_rng = max(float(bt_vt.max()) - bt_min, 1e-6)
+            obs[35 + bt] = (float(self.viability[r, c, bt]) - bt_min) / bt_rng
 
+        # Rival counts by radius [39:43]
         rival_cell_code = PHASE_TO_CELL[phase]
-        for ri,radius in enumerate([1,2,3,4]):
-            count = sum(1 for dr in range(-radius,radius+1)
-                        for dc in range(-radius,radius+1)
-                        if 0<=r+dr<GS and 0<=c+dc<GS
-                        and self.grid[r+dr,c+dc]==rival_cell_code)
-            obs[39+ri] = min(count/10.0, 1.0)
+        for ri, radius in enumerate([1, 2, 3, 4]):
+            count = sum(
+                1 for dr in range(-radius, radius + 1)
+                for dc in range(-radius, radius + 1)
+                if (0 <= r+dr < GS and 0 <= c+dc < GS
+                    and self.grid[r+dr, c+dc] == rival_cell_code)
+            )
+            obs[39 + ri] = min(count / 10.0, 1.0)
 
-        obs[43] = np.sum(self.grid==MARKET)  /10.0
-        obs[44] = np.sum(self.grid==TAXI)    /10.0
-        obs[45] = np.sum(self.grid==SCHOOL)  /10.0
-        obs[46] = np.sum(self.grid==HOSPITAL)/10.0
+        # Landmark counts [43:47]
+        obs[43] = np.sum(self.grid == MARKET)   / 10.0
+        obs[44] = np.sum(self.grid == TAXI)     / 10.0
+        obs[45] = np.sum(self.grid == SCHOOL)   / 10.0
+        obs[46] = np.sum(self.grid == HOSPITAL) / 10.0
 
-        return np.clip(obs,0.0,1.0)
+        # Phase pressure signal [47] — tells agent how urgent placement is
+        obs[47] = min(self._steps_in_phase / PHASE_BUDGET, 1.0)
 
-    # ── Grid building (dense — minimal empty) ─────────────────────────────────
+        return np.clip(obs, 0.0, 1.0)
+
+    # ── Grid building ──────────────────────────────────────────────────────────
     def _build_grid(self):
         rng     = self.np_random
-        grid    = np.zeros((GS,GS),dtype=np.int32)
+        grid    = np.zeros((GS, GS), dtype=np.int32)
         profile = SECTOR_PROFILES[self._sector]
 
-        # ── Roads: 2-layer system ────────────────────────────────────────────
-        # Layer 1: 2-3 main arteries (full-width H and V roads)
-        n_main = int(rng.integers(2,4))
+        n_main    = int(rng.integers(2, 4))
         main_rows = sorted(rng.choice(GS, n_main, replace=False).tolist())
         main_cols = sorted(rng.choice(GS, n_main, replace=False).tolist())
-        for rr in main_rows: grid[rr,:] = ROAD
-        for cc in main_cols: grid[:,cc] = ROAD
+        for rr in main_rows: grid[rr, :] = ROAD
+        for cc in main_cols: grid[:, cc] = ROAD
 
-        # Layer 2: 6-10 neighbourhood streets (short segments branching off mains)
-        # Streets run perpendicular from main roads into residential blocks.
-        # Length: 3-6 cells, so they reach into the neighbourhood.
-        n_streets = int(rng.integers(6,11))
-        all_road_rows = set(main_rows); all_road_cols = set(main_cols)
-        for _ in range(n_streets * 4):   # extra attempts for placement
+        n_streets    = int(rng.integers(6, 11))
+        all_road_rows= set(main_rows)
+        all_road_cols= set(main_cols)
+        for _ in range(n_streets * 4):
             if n_streets <= 0: break
-            # Pick a random main road cell as the branch point
             if float(rng.random()) < 0.5 and main_rows:
-                # Branch vertically off a horizontal main road
-                base_r = int(rng.choice(main_rows))
-                base_c = int(rng.integers(1, GS-1))
-                length = int(rng.integers(3,7))
-                direction = 1 if base_r < GS//2 else -1
-                for step in range(1, length+1):
-                    nr = base_r + direction*step
-                    if 0<=nr<GS and grid[nr,base_c]==EMPTY:
-                        grid[nr,base_c] = ROAD
+                base_r    = int(rng.choice(main_rows))
+                base_c    = int(rng.integers(1, GS - 1))
+                length    = int(rng.integers(3, 7))
+                direction = 1 if base_r < GS // 2 else -1
+                for step in range(1, length + 1):
+                    nr = base_r + direction * step
+                    if 0 <= nr < GS and grid[nr, base_c] == EMPTY:
+                        grid[nr, base_c] = ROAD
                         all_road_cols.add(base_c)
                 n_streets -= 1
             elif main_cols:
-                # Branch horizontally off a vertical main road
-                base_c = int(rng.choice(main_cols))
-                base_r = int(rng.integers(1, GS-1))
-                length = int(rng.integers(3,7))
-                direction = 1 if base_c < GS//2 else -1
-                for step in range(1, length+1):
-                    nc = base_c + direction*step
-                    if 0<=nc<GS and grid[base_r,nc]==EMPTY:
-                        grid[base_r,nc] = ROAD
+                base_c    = int(rng.choice(main_cols))
+                base_r    = int(rng.integers(1, GS - 1))
+                length    = int(rng.integers(3, 7))
+                direction = 1 if base_c < GS // 2 else -1
+                for step in range(1, length + 1):
+                    nc = base_c + direction * step
+                    if 0 <= nc < GS and grid[base_r, nc] == EMPTY:
+                        grid[base_r, nc] = ROAD
                         all_road_rows.add(base_r)
                 n_streets -= 1
 
-        # ── Residential fill (dense blobs + scatter) ──────────────────────────
         if profile["res_fill"]:
-            # Large residential zones
             for _ in range(4):
-                or2 = int(rng.integers(0,GS-4))
-                oc  = int(rng.integers(0,GS-4))
-                for dr in range(int(rng.integers(3,6))):
-                    for dc in range(int(rng.integers(3,6))):
-                        nr,nc = or2+dr, oc+dc
-                        if 0<=nr<GS and 0<=nc<GS and grid[nr,nc]==EMPTY:
-                            grid[nr,nc] = RESIDENTIAL
+                or2 = int(rng.integers(0, GS - 4))
+                oc  = int(rng.integers(0, GS - 4))
+                for dr in range(int(rng.integers(3, 6))):
+                    for dc in range(int(rng.integers(3, 6))):
+                        nr, nc = or2 + dr, oc + dc
+                        if 0 <= nr < GS and 0 <= nc < GS and grid[nr, nc] == EMPTY:
+                            grid[nr, nc] = RESIDENTIAL
 
-        # Fill remaining EMPTY cells with RESIDENTIAL to make map dense
         for rr in range(GS):
             for cc in range(GS):
-                if grid[rr,cc] == EMPTY:
-                    grid[rr,cc] = RESIDENTIAL
+                if grid[rr, cc] == EMPTY:
+                    grid[rr, cc] = RESIDENTIAL
 
-        # ── Landmark placement ────────────────────────────────────────────────
         for lname in ["market","taxi","school","church","hospital","industrial"]:
             count = profile[lname]
             cv    = LANDMARK_CELL[lname]
-            placed = 0
+            placed= 0
             for _ in range(500):
                 if placed >= count: break
-                rr2 = int(rng.integers(0,GS))
-                cc2 = int(rng.integers(0,GS))
-                if grid[rr2,cc2] in (RESIDENTIAL, EMPTY):
-                    grid[rr2,cc2] = cv
+                rr2 = int(rng.integers(0, GS))
+                cc2 = int(rng.integers(0, GS))
+                if grid[rr2, cc2] in (RESIDENTIAL, EMPTY):
+                    grid[rr2, cc2] = cv
                     placed += 1
-                    # cluster chance
                     if float(rng.random()) < 0.45 and placed < count:
-                        for dr,dc in [(-1,0),(1,0),(0,-1),(0,1)]:
-                            nr,nc = rr2+dr,cc2+dc
-                            if (0<=nr<GS and 0<=nc<GS
-                                    and grid[nr,nc]==RESIDENTIAL
+                        for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+                            nr, nc = rr2 + dr, cc2 + dc
+                            if (0 <= nr < GS and 0 <= nc < GS
+                                    and grid[nr, nc] == RESIDENTIAL
                                     and placed < count):
-                                grid[nr,nc]=cv; placed+=1; break
+                                grid[nr, nc] = cv; placed += 1; break
 
-        # ── Place rival businesses ─────────────────────────────────────────────
-        # Rivals per type: difficulty 0.0 → 6/type, 1.0 → 18/type
-        # These are FIXED businesses already on the map — they don't change.
-        # Higher difficulty = more competitors = harder to find good spots.
-        min_rivals = 6
+        min_rivals = 2   # reduced: fewer rivals at low diff = more valid placement cells
         max_rivals = 18
         base = int(min_rivals + self.difficulty * (max_rivals - min_rivals))
-        # Add per-episode randomness (±2)
-        base = int(rng.integers(max(min_rivals, base-2),
-                                min(max_rivals+1, base+3)))
+        base = int(rng.integers(max(min_rivals, base - 2),
+                                min(max_rivals + 1, base + 3)))
         self._n_rivals = {}
 
         for btype in range(N_PHASES):
             biz_cell = PHASE_TO_CELL[btype]
-            placed = 0
+            placed   = 0
             attempts = 0
             while placed < base and attempts < 1500:
                 attempts += 1
-                rr2 = int(rng.integers(0,GS))
-                cc2 = int(rng.integers(0,GS))
-                # Place on residential (or empty if residential ran out)
-                if grid[rr2,cc2] in (RESIDENTIAL, EMPTY):
-                    grid[rr2,cc2] = biz_cell
+                rr2 = int(rng.integers(0, GS))
+                cc2 = int(rng.integers(0, GS))
+                if grid[rr2, cc2] in (RESIDENTIAL, EMPTY):
+                    grid[rr2, cc2] = biz_cell
                     placed += 1
             self._n_rivals[btype] = placed
 
         self.grid = grid
 
-    # ── Viability (spatial ring model) ────────────────────────────────────────
+    # ── Viability ──────────────────────────────────────────────────────────────
     def _compute_viability(self):
-        """
-        For each phase, viability = landmark reward rings - rival penalty rings.
-        Neutral businesses (other types) count as secondary demand sources.
-        Only same-type businesses are rivals.
-        """
-        road_set = {(r,c) for r in range(GS) for c in range(GS)
-                    if self.grid[r,c]==ROAD}
+        road_set = {(r, c) for r in range(GS) for c in range(GS)
+                    if self.grid[r, c] == ROAD}
 
-        # Index positions
-        cell_pos: Dict[int,List] = {}
-        for ct in ([MARKET,RESIDENTIAL,TAXI,HOSPITAL,SCHOOL,CHURCH,INDUSTRIAL]
+        cell_pos: Dict[int, List] = {}
+        for ct in ([MARKET, RESIDENTIAL, TAXI, HOSPITAL, SCHOOL, CHURCH, INDUSTRIAL]
                    + list(PHASE_TO_CELL.values())):
-            cell_pos[ct] = [(r,c) for r in range(GS) for c in range(GS)
-                            if self.grid[r,c]==ct]
+            cell_pos[ct] = [(r, c) for r in range(GS) for c in range(GS)
+                            if self.grid[r, c] == ct]
 
-        v = np.zeros((GS,GS,4),dtype=np.float32)
+        v = np.zeros((GS, GS, 4), dtype=np.float32)
 
         for bt in range(4):
             prim       = PRIMARY_LANDMARKS[bt]
             sec        = SECONDARY_LANDMARKS[bt]
             rival_cell = PHASE_TO_CELL[bt]
 
-            # Reward from landmarks + neutral businesses
-            for ct,positions in cell_pos.items():
+            for ct, positions in cell_pos.items():
                 if ct == rival_cell: continue
                 is_prim = ct in prim
                 is_sec  = ct in sec
-                # Neutral businesses contribute as secondary demand
                 if ct in PHASE_TO_CELL.values() and ct != rival_cell:
                     is_sec = True
                 if not is_prim and not is_sec: continue
                 factor = 1.0 if is_prim else 0.18
 
-                for (lr,lc) in positions:
-                    for radius,base_rw in REWARD_RINGS.items():
+                for (lr, lc) in positions:
+                    for radius, base_rw in REWARD_RINGS.items():
                         rw = base_rw * factor
-                        for r in range(max(0,lr-radius),min(GS,lr+radius+1)):
-                            for c in range(max(0,lc-radius),min(GS,lc+radius+1)):
-                                if abs(r-lr)+abs(c-lc) <= radius:
-                                    v[r,c,bt] += rw
+                        for r in range(max(0, lr-radius), min(GS, lr+radius+1)):
+                            for c in range(max(0, lc-radius), min(GS, lc+radius+1)):
+                                if abs(r-lr) + abs(c-lc) <= radius:
+                                    v[r, c, bt] += rw
 
-            # Penalty from rivals
-            for (cr,cc) in cell_pos.get(rival_cell,[]):
-                for radius,penalty in PENALTY_RINGS.items():
-                    for r in range(max(0,cr-radius),min(GS,cr+radius+1)):
-                        for c in range(max(0,cc-radius),min(GS,cc+radius+1)):
-                            if abs(r-cr)+abs(c-cc) <= radius:
-                                v[r,c,bt] -= penalty
+            for (cr, cc) in cell_pos.get(rival_cell, []):
+                for radius, penalty in PENALTY_RINGS.items():
+                    for r in range(max(0, cr-radius), min(GS, cr+radius+1)):
+                        for c in range(max(0, cc-radius), min(GS, cc+radius+1)):
+                            if abs(r-cr) + abs(c-cc) <= radius:
+                                v[r, c, bt] -= penalty
 
-            # Road bonus
             for r in range(GS):
                 for c in range(GS):
-                    if self.grid[r,c]==ROAD: continue
-                    for dr in [-1,0,1]:
-                        for dc in [-1,0,1]:
-                            if (r+dr,c+dc) in road_set:
-                                v[r,c,bt] += ROAD_BONUS
+                    if self.grid[r, c] == ROAD: continue
+                    for dr in [-1, 0, 1]:
+                        for dc in [-1, 0, 1]:
+                            if (r+dr, c+dc) in road_set:
+                                v[r, c, bt] += ROAD_BONUS
                                 break
                         else:
                             continue
@@ -601,16 +614,15 @@ class KigaliRetailEnv(gym.Env):
 
         self.viability = v
 
-    def _nearest_rival_dist(self, r:int, c:int, phase:int) -> float:
+    def _nearest_rival_dist(self, r: int, c: int, phase: int) -> float:
         rival_cell = PHASE_TO_CELL[phase]
-        best = float(GS*2)
+        best = float(GS * 2)
         for rr in range(GS):
             for cc in range(GS):
-                if self.grid[rr,cc]==rival_cell:
-                    best = min(best, abs(r-rr)+abs(c-cc))
+                if self.grid[rr, cc] == rival_cell:
+                    best = min(best, abs(r-rr) + abs(c-cc))
         return best
 
-    # ── Convenience properties ─────────────────────────────────────────────────
     @property
     def _placed_pos(self):
         return self._placed_positions[-1] if self._placed_positions else None
@@ -621,11 +633,10 @@ class KigaliRetailEnv(gym.Env):
 
     @property
     def current_business(self) -> str:
-        return BUSINESS_NAMES[min(self._phase, N_PHASES-1)]
+        return BUSINESS_NAMES[min(self._phase, N_PHASES - 1)]
 
-    # ── Render ─────────────────────────────────────────────────────────────────
     def render(self):
-        if self.render_mode=="human":
+        if self.render_mode == "human":
             try:
                 from environment.rendering import KigaliRenderer
             except ImportError:
@@ -654,22 +665,33 @@ class KigaliRetailEnv(gym.Env):
 
 def make_env(sector_id=None, render_mode=None, difficulty=0.5):
     def _init():
-        return KigaliRetailEnv(sector_id=sector_id,
-                               render_mode=render_mode,
-                               difficulty=difficulty)
+        return KigaliRetailEnv(
+            sector_id=sector_id, render_mode=render_mode, difficulty=difficulty)
     return _init
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     env = KigaliRetailEnv(difficulty=0.5)
-    obs,info = env.reset(seed=42)
-    print(f"Sector: {info['sector']}")
-    print(f"Rivals/type: {info['n_rivals']}")
-    print(f"Phase: {info['phase']} ({info['business']})")
-    print(f"Obs: {obs.shape}  Actions: {env.action_space.n}")
-    print(f"Viability range: {env.viability.min():.2f} to {env.viability.max():.2f}")
+    obs, info = env.reset(seed=42)
+    print(f"Sector    : {info['sector']}")
+    print(f"Rivals/typ: {info['n_rivals']}")
+    print(f"Phase 0   : {info['business']}")
+    print(f"Obs shape : {obs.shape}  Actions: {env.action_space.n}")
+    print(f"Viab range: {env.viability.min():.3f} to {env.viability.max():.3f}")
+
+    # Quick sanity: run 20 random steps, check rewards
     import collections
-    cell_counts = collections.Counter(env.grid.flatten().tolist())
-    print(f"Cell counts: {dict(sorted(cell_counts.items()))}")
+    total_r = 0.0
+    for i in range(20):
+        a = env.action_space.sample()
+        obs, r, term, trunc, info = env.step(a)
+        total_r += r
+        if info.get("optimal"):
+            print(f"  step {i+1}: OPTIMAL PLACEMENT v_norm={info['v_norm']:.2f} r={r:.2f}")
+        if info.get("decent"):
+            print(f"  step {i+1}: decent placement  v_norm={info['v_norm']:.2f} r={r:.2f}")
+        if term or trunc:
+            break
+    print(f"Total reward (20 steps): {total_r:.3f}")
     env.close()
     print("OK")

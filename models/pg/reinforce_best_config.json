@@ -1,7 +1,8 @@
 {
   "lr": 0.001,
   "gamma": 0.99,
-  "entropy_coef": 0.005,
-  "hidden": 128,
-  "diff": 0.4
+  "entropy_coef": 0.015,
+  "hidden": 256,
+  "diff": 0.25,
+  "n_episodes": 8000
 }

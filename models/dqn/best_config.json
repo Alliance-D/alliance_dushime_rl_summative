@@ -1,9 +1,12 @@
 {
-  "lr": 0.0003,
+  "lr": 0.0005,
   "gamma": 0.99,
   "buffer": 100000,
-  "batch": 256,
-  "expl": 0.5,
+  "batch": 128,
+  "exploration_fraction": 0.4,
+  "exploration_initial_eps": 1.0,
+  "exploration_final_eps": 0.05,
   "tui": 1000,
-  "diff": 0.3
+  "diff": 0.2,
+  "total_ts": 200000
 }

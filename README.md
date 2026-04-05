@@ -8,11 +8,11 @@
 ## Problem Statement
 
 Rwanda's urban economy is growing rapidly. Small retailers must decide *where* to set up
-shop on a limited budget. Good placement — near foot-traffic generators, away from
-saturated competition, accessible by road — is the difference between profitability and
+shop on a limited budget. Good placement; near foot-traffic generators, away from
+saturated competition, accessible by road, is the difference between profitability and
 closure within the first year. This project trains RL agents to learn optimal site-
 selection strategies across four real Kigali sectors: **Kimironko, Nyabugogo, Remera,
-and Commercial Zone**.
+and Masoro**.
 
 ---
 
@@ -41,7 +41,7 @@ kigali_rl/
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/<your_username>/student_name_rl_summative.git
+git clone https://github.com/Alliance-D/student_name_rl_summative.git
 cd student_name_rl_summative
 
 # 2. Install dependencies
@@ -55,8 +55,18 @@ python training/dqn_training.py --sweep
 python training/pg_training.py --algo reinforce --sweep
 python training/pg_training.py --algo ppo --sweep
 
-# 5. Run best agent with GUI + verbose terminal output
+# 4b. Train best experiment (optimal HPs, 11th run per algorithm)
+python training/best_experiment.py              # all 3 algorithms
+python training/best_experiment.py --algo ppo  # single algorithm
+
+# 5. Generate all required plots from training data
+python generate_plots.py
+
+# 6. Run best agent with GUI + verbose terminal output
 python main.py --algo auto
+python main.py --algo reinforce         # best overall model
+python main.py --algo dqn --run 38     # specific run
+python main.py --algo dqn --no-render  # terminal only
 
 # 6. Export policy as JSON API spec (production integration demo)
 python main.py --algo ppo --export-api
@@ -71,11 +81,11 @@ python main.py --algo ppo --export-api
 | Grid size          | 15 × 15 per sector                   |
 | Observation space  | Box(56,) – local 5×5 grid + context features|
 | Action space       | Discrete(6)                          |
-| Sectors            | Kimironko, Nyabugogo, Remera, Commercial Zone |
+| Sectors            | Kimironko, Nyabugogo, Remera, Masoro |
 | Landmark types     | 8 (market, road, residential, etc.)  |
 | Rivals per type    | 6–18 (scales with difficulty)        |
 | Max steps          | 400                                  |
-| Business phases    | 4 (Grocery → Pharmacy → Restaurant → Salon) |
+| Business phases    | 4 (Grocery -> Pharmacy -> Restaurant -> Salon) |
 
 ### Action Space
 
@@ -110,15 +120,21 @@ python main.py --algo ppo --export-api
 ### Reward Structure
 
 ```
-Movement/wall:       0.0           (no penalty)
-Wall collision:     -0.2
-Survey action:      +0.3
-Place (optimal):    +20 × viability_norm  (top 30% locations, no rival nearby)
-Place (decent):     +8 × viability_norm   (30–60% range)
-Place (poor):       -10 × (1 - viability_norm)  (<30% or close rival)
-All 4 placed:       +30            (completion bonus)
-Timeout:            -10 × missed   (per unplaced business)
+Movement (0–3):      0.0    (pure process, no reward or penalty)
+Survey new cell:     0.0    (records viability info, no reward)
+Survey repeat:       0.0    (true no-op, no gradient signal)
+Invalid placement:  -1.0    (road or existing business cell)
+Place (optimal):    +30 × viability_norm   (top 70th percentile, no close rival)
+Place (decent):     +10 × viability_norm   (30–70th percentile)
+Place (poor):       +1.0 to +4.0           (always positive, any placement beats nothing)
+All 4 placed:       +50    (completion bonus)
+Timeout:            -6.0 × missed_placements
 ```
+
+**Design principle**: Only placement outcomes generate reward. All movement and
+survey actions are intentionally zero-reward so the agent learns to move and
+explore only in service of finding better placement locations, exactly as a real
+entrepreneur would.
 
 ---
 
@@ -221,19 +237,37 @@ def predict(observation: list[float]):
 
 ## Results Summary
 
-Results are generated automatically during training sweeps and saved under `plots/`:
+Run `python generate_plots.py` to regenerate all plots from training CSVs.
 
-- `dqn_cumulative_rewards.png`   – DQN per-run cumulative reward curves
-- `ppo_cumulative_rewards.png`   – PPO per-run cumulative reward curves
-- `reinforce_cumulative_rewards.png` – REINFORCE per-run curves
-- `ppo_entropy.png`              – PPO policy entropy over training
-- `reinforce_entropy.png`        – REINFORCE entropy
+### Required plots (rubric)
+
+| File | Description |
+|------|-------------|
+| `cumulative_rewards_comparison.png` | All 3 algorithms, mean reward per run (subplots) |
+| `convergence_comparison.png`        | All 3 on same axis, rolling mean vs experiment index |
+| `generalisation_test.png`           | Performance vs difficulty level (proxy for generalisation) |
+| `best_model_comparison.png`         | Best run from each algorithm, bar chart with error bars |
+| `dqn_hyperparameter_sensitivity.png`| DQN: lr, exploration, difficulty vs performance |
+| `dqn_rewards.png`                   | DQN per-run learning curves (all runs) |
+| `dqn_td_loss.png`                   | DQN objective stability (rolling std of reward) |
+| `ppo_rewards.png`                   | PPO per-run learning curves (all runs) |
+| `ppo_entropy.png`                   | PPO policy entropy over training |
+| `reinforce_rewards.png`             | REINFORCE per-run learning curves |
+| `reinforce_entropy.png`             | REINFORCE policy entropy over training |
+
+### Best results
+- **REINFORCE Run 11**: mean=+69.37 ± 29.64 (best overall)
+- **DQN Run 38**: mean=+17.55 ± 61.92
+- **PPO Run 12**: mean=-173.81 (PPO training curves reach +50 to +75; eval collapse)
+
+See `BEST_MODELS.md` for full analysis of why each best model performed best
+and what the hyperparameter sweep reveals.
 
 ---
 
 ## Justification for Grid-World Approach
 
-The 15×15 grid is not an arbitrary abstraction — each cell directly maps to a real
+The 15×15 grid is not an arbitrary abstraction, each cell directly maps to a real
 Kigali land-use category (market hub, taxi stop, residential zone, etc.) with
 sector-specific landmark profiles derived from each neighbourhood's actual
 commercial character. The environment's complexity comes from:
@@ -243,4 +277,4 @@ commercial character. The environment's complexity comes from:
 4. **Multi-modal action space** (navigate, survey, place)
 
 This is analogous to how OpenStreetMap-based urban planning simulators discretise
-continuous space into parcels — a standard methodology in computational urban economics.
+continuous space into parcels, a standard methodology in computational urban economics.

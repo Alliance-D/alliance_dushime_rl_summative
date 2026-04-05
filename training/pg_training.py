@@ -50,7 +50,7 @@ PLOTS_DIR   = os.path.join(ROOT, "plots")
 LOG_DIR     = os.path.join(ROOT, "logs", "pg")
 CSV_PPO     = os.path.join(ROOT, "training", "ppo_results.csv")
 CSV_RE      = os.path.join(ROOT, "training", "reinforce_results.csv")
-TOTAL_TS    = 300_000
+TOTAL_TS    = 200_000
 EVAL_EPS    = 20
 
 for d in [MODELS_DIR, PLOTS_DIR, LOG_DIR, os.path.join(ROOT,"training")]:
