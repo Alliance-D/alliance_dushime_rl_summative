@@ -278,3 +278,5 @@ commercial character. The environment's complexity comes from:
 
 This is analogous to how OpenStreetMap-based urban planning simulators discretise
 continuous space into parcels, a standard methodology in computational urban economics.
+
+Video Link; https://youtu.be/kvdFaTO_y0A 
